@@ -1,0 +1,491 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Portal de Gobierno de IA de Redeban. Backend serverless completo
+  (API Gateway + Lambda + DynamoDB + S3 + SES + Cognito) + hosting de la SPA (S3 + CloudFront).
+
+Parameters:
+  RecipientEmail:
+    Type: String
+    Description: Correo destino de las notificaciones de solicitudes.
+  SenderEmail:
+    Type: String
+    Description: Identidad SES verificada que envia los correos.
+  AllowedOrigin:
+    Type: String
+    Default: "*"
+    Description: Origen permitido para CORS (en produccion, usar el dominio de CloudFront).
+
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    Timeout: 20
+    MemorySize: 256
+    Architectures: [arm64]
+    CodeUri: ../
+    Environment:
+      Variables:
+        ALLOWED_ORIGIN: !Ref AllowedOrigin
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # DynamoDB
+  # ---------------------------------------------------------------------------
+  SubmissionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: redeban-form-submissions
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: submissionId, AttributeType: S }
+        - { AttributeName: type, AttributeType: S }
+        - { AttributeName: createdAt, AttributeType: S }
+      KeySchema:
+        - { AttributeName: submissionId, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: type-createdAt-index
+          KeySchema:
+            - { AttributeName: type, KeyType: HASH }
+            - { AttributeName: createdAt, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      SSESpecification: { SSEEnabled: true }
+
+  FaqsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: redeban-faqs
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: id, KeyType: HASH }
+      SSESpecification: { SSEEnabled: true }
+
+  # ---------------------------------------------------------------------------
+  # S3: PDFs de solicitudes y catalogo de agentes
+  # ---------------------------------------------------------------------------
+  SubmissionsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "redeban-submissions-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # Bucket donde el equipo CoE sube el Excel del catalogo (dispara el Lambda de procesamiento)
+  CatalogUploadBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: CatalogInvokePermission
+    Properties:
+      BucketName: !Sub "redeban-agents-catalog-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt CatalogProcessorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - { Name: suffix, Value: ".xlsx" }
+
+  # ---------------------------------------------------------------------------
+  # Cognito (panel admin)
+  # ---------------------------------------------------------------------------
+  AdminUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: redeban-ia-admins
+      AdminCreateUserConfig: { AllowAdminCreateUserOnly: true }
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+          RequireLowercase: true
+
+  AdminUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: redeban-ia-admin-spa
+      UserPoolId: !Ref AdminUserPool
+      ExplicitAuthFlows: [ALLOW_USER_SRP_AUTH, ALLOW_USER_PASSWORD_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      GenerateSecret: false
+
+  # Grupos (roles). Un usuario sin grupo se trata como "Usuario" en el frontend.
+  AdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: { GroupName: Admin, Description: Acceso total, UserPoolId: !Ref AdminUserPool }
+  ComiteTecnicoGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: { GroupName: ComiteTecnico, Description: Inicio / formularios / noticias, UserPoolId: !Ref AdminUserPool }
+  CoeGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: { GroupName: COE, Description: Inicio / formularios / noticias, UserPoolId: !Ref AdminUserPool }
+  UsuarioGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: { GroupName: Usuario, Description: Inicio / formularios / noticias, UserPoolId: !Ref AdminUserPool }
+
+  # ---------------------------------------------------------------------------
+  # API Gateway (REST) con autorizador Cognito
+  # ---------------------------------------------------------------------------
+  RedebanApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: redeban-gobierno-ia-api
+      StageName: prod
+      Cors:
+        AllowOrigin: !Sub "'${AllowedOrigin}'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowMethods: "'GET,POST,PUT,PATCH,DELETE,OPTIONS'"
+      Auth:
+        Authorizers:
+          CognitoAuth:
+            UserPoolArn: !GetAtt AdminUserPool.Arn
+  # ---------------------------------------------------------------------------
+  # Lambdas: Submissions (formularios de caso de uso e iniciativa tecnica)
+  # ---------------------------------------------------------------------------
+  SubmitBusinessFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: redeban-submit-business
+      Handler: submissions/handler.submitBusiness
+      Environment:
+        Variables:
+          DYNAMODB_SUBMISSIONS_TABLE: !Ref SubmissionsTable
+          S3_SUBMISSIONS_BUCKET: !Ref SubmissionsBucket
+          RECIPIENT_EMAIL: !Ref RecipientEmail
+          SENDER_EMAIL: !Ref SenderEmail
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref SubmissionsTable }
+        - S3CrudPolicy: { BucketName: !Ref SubmissionsBucket }
+        - SESCrudPolicy: { IdentityName: !Ref SenderEmail }
+      Events:
+        Post:
+          Type: Api
+          Properties: { RestApiId: !Ref RedebanApi, Path: /submissions/business, Method: post }
+
+  SubmitTechnicalFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: redeban-submit-technical
+      Handler: submissions/handler.submitTechnical
+      Environment:
+        Variables:
+          DYNAMODB_SUBMISSIONS_TABLE: !Ref SubmissionsTable
+          S3_SUBMISSIONS_BUCKET: !Ref SubmissionsBucket
+          RECIPIENT_EMAIL: !Ref RecipientEmail
+          SENDER_EMAIL: !Ref SenderEmail
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref SubmissionsTable }
+        - S3CrudPolicy: { BucketName: !Ref SubmissionsBucket }
+        - SESCrudPolicy: { IdentityName: !Ref SenderEmail }
+      Events:
+        Post:
+          Type: Api
+          Properties: { RestApiId: !Ref RedebanApi, Path: /submissions/technical, Method: post }
+
+  ListSubmissionsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: redeban-admin-list-submissions
+      Handler: submissions/handler.listSubmissions
+      Environment:
+        Variables:
+          DYNAMODB_SUBMISSIONS_TABLE: !Ref SubmissionsTable
+          S3_SUBMISSIONS_BUCKET: !Ref SubmissionsBucket
+      Policies:
+        - DynamoDBReadPolicy: { TableName: !Ref SubmissionsTable }
+      Events:
+        Get:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RedebanApi
+            Path: /admin/submissions
+            Method: get
+            Auth: { Authorizer: CognitoAuth }
+
+  GetSubmissionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: redeban-admin-get-submission
+      Handler: submissions/handler.getSubmission
+      Environment:
+        Variables:
+          DYNAMODB_SUBMISSIONS_TABLE: !Ref SubmissionsTable
+          S3_SUBMISSIONS_BUCKET: !Ref SubmissionsBucket
+      Policies:
+        - DynamoDBReadPolicy: { TableName: !Ref SubmissionsTable }
+      Events:
+        Get:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RedebanApi
+            Path: /admin/submissions/{id}
+            Method: get
+            Auth: { Authorizer: CognitoAuth }
+
+  DownloadSubmissionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: redeban-admin-download-submission
+      Handler: submissions/handler.getDownloadUrl
+      Environment:
+        Variables:
+          DYNAMODB_SUBMISSIONS_TABLE: !Ref SubmissionsTable
+          S3_SUBMISSIONS_BUCKET: !Ref SubmissionsBucket
+      Policies:
+        - DynamoDBReadPolicy: { TableName: !Ref SubmissionsTable }
+        - S3ReadPolicy: { BucketName: !Ref SubmissionsBucket }
+      Events:
+        Get:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RedebanApi
+            Path: /admin/submissions/{id}/download
+            Method: get
+            Auth: { Authorizer: CognitoAuth }
+
+  # ---------------------------------------------------------------------------
+  # Lambdas: FAQs (lectura publica + CRUD admin)
+  # ---------------------------------------------------------------------------
+  FaqsPublicFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: redeban-faqs-public
+      Handler: faqs/handler.listPublic
+      Environment:
+        Variables: { DYNAMODB_FAQS_TABLE: !Ref FaqsTable }
+      Policies:
+        - DynamoDBReadPolicy: { TableName: !Ref FaqsTable }
+      Events:
+        Get:
+          Type: Api
+          Properties: { RestApiId: !Ref RedebanApi, Path: /faqs, Method: get }
+
+  FaqsListAdminFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: redeban-faqs-admin-list
+      Handler: faqs/handler.listAdmin
+      Environment:
+        Variables: { DYNAMODB_FAQS_TABLE: !Ref FaqsTable }
+      Policies:
+        - DynamoDBReadPolicy: { TableName: !Ref FaqsTable }
+      Events:
+        Get:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RedebanApi
+            Path: /admin/faqs
+            Method: get
+            Auth: { Authorizer: CognitoAuth }
+
+  FaqsCreateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: redeban-faqs-create
+      Handler: faqs/handler.create
+      Environment:
+        Variables: { DYNAMODB_FAQS_TABLE: !Ref FaqsTable }
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref FaqsTable }
+      Events:
+        Post:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RedebanApi
+            Path: /admin/faqs
+            Method: post
+            Auth: { Authorizer: CognitoAuth }
+
+  FaqsUpdateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: redeban-faqs-update
+      Handler: faqs/handler.update
+      Environment:
+        Variables: { DYNAMODB_FAQS_TABLE: !Ref FaqsTable }
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref FaqsTable }
+      Events:
+        Put:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RedebanApi
+            Path: /admin/faqs/{id}
+            Method: put
+            Auth: { Authorizer: CognitoAuth }
+
+  FaqsDeleteFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: redeban-faqs-delete
+      Handler: faqs/handler.remove
+      Environment:
+        Variables: { DYNAMODB_FAQS_TABLE: !Ref FaqsTable }
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref FaqsTable }
+      Events:
+        Delete:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RedebanApi
+            Path: /admin/faqs/{id}
+            Method: delete
+            Auth: { Authorizer: CognitoAuth }
+
+  FaqsReorderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: redeban-faqs-reorder
+      Handler: faqs/handler.reorder
+      Environment:
+        Variables: { DYNAMODB_FAQS_TABLE: !Ref FaqsTable }
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref FaqsTable }
+      Events:
+        Put:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RedebanApi
+            Path: /admin/faqs/reorder
+            Method: put
+            Auth: { Authorizer: CognitoAuth }
+
+  # ---------------------------------------------------------------------------
+  # Lambda: procesamiento del catalogo de agentes (Excel subido a S3 -> JSON)
+  # ---------------------------------------------------------------------------
+  CatalogProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: redeban-agents-catalog-processor
+      Handler: admin/catalogHandler.processCatalog
+      Timeout: 60
+      MemorySize: 512
+      Environment:
+        Variables:
+          CATALOG_OUTPUT_BUCKET: !Ref WebBucket
+          CATALOG_OUTPUT_KEY: "data/agents-catalog.json"
+      Policies:
+        - S3ReadPolicy: { BucketName: !Sub "redeban-agents-catalog-${AWS::AccountId}" }
+        - S3CrudPolicy: { BucketName: !Ref WebBucket }
+      # Nota: se invoca manualmente o se conecta el trigger S3 por separado (ver
+      # CatalogBucketNotification abajo) para evitar dependencias circulares en SAM.
+
+  # Permiso para que S3 (bucket de catalogo) invoque el Lambda procesador.
+  CatalogInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CatalogProcessorFunction
+      Principal: s3.amazonaws.com
+      # ARN construido con !Sub (no !GetAtt) para no crear dependencia circular
+      # bucket -> permiso -> bucket. El nombre coincide con CatalogUploadBucket.
+      SourceArn: !Sub "arn:aws:s3:::redeban-agents-catalog-${AWS::AccountId}"
+      SourceAccount: !Ref AWS::AccountId
+
+  # ---------------------------------------------------------------------------
+  # Hosting de la SPA: S3 privado + CloudFront con Origin Access Control (OAC)
+  # ---------------------------------------------------------------------------
+  WebBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "redeban-gobierno-ia-web-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  WebBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "arn:aws:s3:::${WebBucket}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${WebDistribution}"
+
+  WebOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: redeban-web-oac
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  WebDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: Portal de Gobierno de IA de Redeban (SPA)
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_100
+        HttpVersion: http2
+        Origins:
+          - Id: WebS3Origin
+            DomainName: !GetAtt WebBucket.RegionalDomainName
+            OriginAccessControlId: !Ref WebOAC
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: WebS3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          # Managed-CachingOptimized
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        # SPA fallback: rutas del router devuelven index.html
+        CustomErrorResponses:
+          - { ErrorCode: 403, ResponseCode: 200, ResponsePagePath: /index.html, ErrorCachingMinTTL: 10 }
+          - { ErrorCode: 404, ResponseCode: 200, ResponsePagePath: /index.html, ErrorCachingMinTTL: 10 }
+
+# -----------------------------------------------------------------------------
+Outputs:
+  ApiBaseUrl:
+    Description: URL base del API Gateway (usar en VITE_API_BASE_URL)
+    Value: !Sub "https://${RedebanApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+  UserPoolId:
+    Description: Cognito User Pool ID (VITE_COGNITO_USER_POOL_ID)
+    Value: !Ref AdminUserPool
+  UserPoolClientId:
+    Description: Cognito App Client ID (VITE_COGNITO_CLIENT_ID)
+    Value: !Ref AdminUserPoolClient
+  WebBucketName:
+    Description: Bucket S3 del frontend (destino de 'aws s3 sync dist/')
+    Value: !Ref WebBucket
+  CatalogUploadBucketName:
+    Description: Bucket donde el CoE sube el Excel del catalogo de agentes
+    Value: !Ref CatalogUploadBucket
+  CloudFrontUrl:
+    Description: URL publica del portal
+    Value: !Sub "https://${WebDistribution.DomainName}"
+  CloudFrontDistributionId:
+    Description: ID de la distribucion CloudFront (para invalidaciones)
+    Value: !Ref WebDistribution

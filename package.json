@@ -1,0 +1,19 @@
+{
+  "name": "coeia-backend",
+  "version": "1.0.0",
+  "description": "Funciones Lambda del Portal de Gobierno de IA de Redeban (solicitudes, FAQs, catalogo).",
+  "private": true,
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "xlsx": "0.18.5"
+  },
+  "devDependencies": {
+    "@aws-sdk/client-dynamodb": "^3.600.0",
+    "@aws-sdk/lib-dynamodb": "^3.600.0",
+    "@aws-sdk/client-s3": "^3.600.0",
+    "@aws-sdk/s3-request-presigner": "^3.600.0",
+    "@aws-sdk/client-ses": "^3.600.0"
+  }
+}

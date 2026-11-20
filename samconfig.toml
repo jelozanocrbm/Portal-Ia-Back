@@ -1,0 +1,19 @@
+# Configuracion de despliegue SAM — Portal de Gobierno de IA de Redeban
+# Permite ejecutar simplemente: sam build --template infra/template.yaml && sam deploy
+# Ajusta RecipientEmail / SenderEmail a las direcciones verificadas en SES.
+
+version = 0.1
+
+[default.global.parameters]
+stack_name = "redeban-gobierno-ia"
+
+[default.build.parameters]
+template_file = "infra/template.yaml"
+
+[default.deploy.parameters]
+stack_name = "redeban-gobierno-ia"
+region = "us-east-1"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+resolve_s3 = true
+parameter_overrides = "RecipientEmail=\"coe-ia@redeban.com\" SenderEmail=\"noreply@redeban.com\""
